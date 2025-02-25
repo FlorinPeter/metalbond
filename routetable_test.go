@@ -2,6 +2,7 @@ package metalbond
 
 import (
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/ironcore-dev/metalbond/pb"
@@ -311,11 +312,16 @@ var _ = Describe("RouteTable", func() {
 	})
 
 	// concurrency test
+	// concurrency test
 	Describe("Concurrency safety", func() {
-		It("should allow concurrent reads and writes without data corruption", func(done Done) {
+		It("should allow concurrent reads and writes without data corruption", func() {
+			var wg sync.WaitGroup
+			wg.Add(20) // 10 writers + 10 readers
+
 			// Fill route table with some data
 			for i := 0; i < 10; i++ {
 				go func() {
+					defer wg.Done()
 					d := Destination{
 						Prefix:    netip.MustParsePrefix("192.168.10.0/24"),
 						IPVersion: IPV4,
@@ -331,15 +337,30 @@ var _ = Describe("RouteTable", func() {
 			// Concurrently read from route table
 			for i := 0; i < 10; i++ {
 				go func() {
+					defer wg.Done()
 					_ = rt.GetDestinationsByVNI(vni)
 				}()
 			}
 
-			// Let it run briefly
-			time.Sleep(100 * time.Millisecond)
+			// Use Eventually to wait for the WaitGroup with a timeout
+			Eventually(func() bool {
+				// Create a channel to signal when WaitGroup is done
+				done := make(chan struct{})
+				go func() {
+					wg.Wait()
+					close(done)
+				}()
 
-			// If no race/panic => success
-			close(done)
-		}, 1.0) // Timeout after 1 second
+				// Wait with timeout
+				select {
+				case <-done:
+					return true
+				case <-time.After(500 * time.Millisecond):
+					return false
+				}
+			}).Should(BeTrue(), "Timed out waiting for goroutines to complete")
+
+			// If we got here with no race/panic => success
+		})
 	})
 })
