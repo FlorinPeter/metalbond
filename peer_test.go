@@ -354,6 +354,92 @@ var _ = Describe("Peer", func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
+	It("should not receive updates after unsubscribe even if enqueued before", func() {
+		// Create a server and client
+		mbClient := NewMetalBond(Config{
+			KeepaliveInterval: 5,
+		}, dummyClient)
+		err := mbClient.AddPeer(serverAddress1, "127.0.0.123", clientTxChanCapacity, clientRxChanEventCapacity, clientRxChanDataUpdateCapacity)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Wait for connection to establish
+		clientAddr := getLocalAddr(mbClient, "")
+		Expect(clientAddr).NotTo(Equal(""))
+		Expect(waitForPeerState(mbServer1, clientAddr, ESTABLISHED)).NotTo(BeFalse())
+		Expect(waitForPeerState(mbClient, serverAddress1, ESTABLISHED)).NotTo(BeFalse())
+
+		// Subscribe to a VNI
+		vni := VNI(200)
+		err = mbClient.Subscribe(vni)
+		Expect(err).NotTo(HaveOccurred())
+		time.Sleep(2 * time.Second)
+
+		// Get server-side peer
+		var serverPeer *metalBondPeer
+		mbServer1.mtxPeers.RLock()
+		serverPeer = mbServer1.peers[clientAddr]
+		mbServer1.mtxPeers.RUnlock()
+		Expect(serverPeer).NotTo(BeNil())
+
+		// Create multiple update messages for the VNI
+		const numUpdates = 2100 // More than txChanCapacity to ensure channel fills up
+		for i := 0; i < numUpdates; i++ {
+			startIP := net.ParseIP("100.64.0.0")
+			ip := incrementIPv4(startIP, i)
+			addr, err := netip.ParseAddr(ip.String())
+			Expect(err).NotTo(HaveOccurred())
+
+			underlayRoute, err := netip.ParseAddr(fmt.Sprintf("b198:5b10:3880:fd32:fb80:80dd:46f7:%d", i))
+			Expect(err).NotTo(HaveOccurred())
+
+			dest := Destination{
+				Prefix:    netip.PrefixFrom(addr, 32),
+				IPVersion: IPV4,
+			}
+			nextHop := NextHop{
+				TargetVNI:     uint32(vni),
+				TargetAddress: underlayRoute,
+			}
+
+			// Fill up the txChan of the server peer by sending update messages
+			// This simulates the "T1" phase in the race condition
+			upd := msgUpdate{
+				Action:      ADD,
+				VNI:         vni,
+				Destination: dest,
+				NextHop:     nextHop,
+			}
+			err = serverPeer.SendUpdate(upd)
+			if err != nil {
+				// If channel is full, this is expected
+				break
+			}
+		}
+
+		// Unsubscribe from the VNI immediately after filling the channel
+		// This simulates the "T2" phase in the race condition
+		err = mbClient.Unsubscribe(vni)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Wait a bit for updates to be processed from the txChan
+		// This simulates the "T3" phase in the race condition
+		time.Sleep(3 * time.Second)
+
+		// Check if the client received any routes after unsubscribe
+		// If the fix is working, there should be no routes for this VNI
+		mbClient.routeTable.rwmtx.RLock()
+		routes, exists := mbClient.routeTable.routes[vni]
+		mbClient.routeTable.rwmtx.RUnlock()
+
+		// With the fix, the client should not have any routes for this VNI
+		// Without the fix, the client would have routes despite being unsubscribed
+		Expect(exists).To(BeFalse(), "Client should not have routes for VNI after unsubscribe")
+		if exists {
+			// Additional diagnostic info if this fails
+			Expect(len(routes)).To(Equal(0), fmt.Sprintf("Client has %d routes after unsubscribe", len(routes)))
+		}
+	})
+
 	It("should cleanup announcements on unsubscribe", func() {
 		mbClient := NewMetalBond(Config{
 			KeepaliveInterval: 5,

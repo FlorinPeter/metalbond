@@ -676,6 +676,16 @@ func (p *metalBondPeer) processRxUnsubscribe(msg msgUnsubscribe) {
 func (p *metalBondPeer) processRxUpdate(msg msgUpdate) {
 	var err error
 	if p.GetState() == ESTABLISHED {
+		if p.direction == OUTGOING {
+			// Check if we're still subscribed to this VNI before processing the update
+			subscribed := p.metalbond.IsSubscribed(msg.VNI)
+
+			// Skip processing if we're no longer subscribed to this VNI
+			if !subscribed {
+				p.log().Debugf("Ignoring UPDATE for VNI %d as we're no longer subscribed", msg.VNI)
+				return
+			}
+		}
 		switch msg.Action {
 		case ADD:
 			err = p.receivedRoutes.AddNextHop(msg.VNI, msg.Destination, msg.NextHop, p)
