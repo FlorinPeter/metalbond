@@ -37,6 +37,7 @@ $CONTAINER_CLI build \
   --build-arg CI_JOB_TOKEN="${CI_JOB_TOKEN}" \
   --build-arg OSC_BUILD_VERSION="$commit" \
   --build-arg OSC_BUILD_COMMIT_SHA="${CI_COMMIT_SHA}" \
+  --build-arg METALBOND_VERSION="$commit" \
   $LABEL \
   --build-arg CI_SERVER_HOST="${CI_SERVER_HOST}" \
   --build-arg CI_PROJECT_PATH="${CI_PROJECT_PATH}" \

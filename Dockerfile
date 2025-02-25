@@ -11,23 +11,23 @@ COPY go.sum go.sum
 
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg \
-    go mod download
+RUN go mod download
 
 COPY cmd cmd
 COPY html html
 COPY pb pb
 COPY *.go ./
+COPY Makefile ./
 
 ARG TARGETOS
 ARG TARGETARCH
 
+# Run unit tests first
+RUN make unit-test
+
 # Build
 ARG METALBOND_VERSION
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg \
-    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -buildvcs=false -ldflags "-s -w -X github.com/ironcore-dev/metalbond.METALBOND_VERSION=$METALBOND_VERSION" -o metalbond cmd/cmd.go
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -buildvcs=false -ldflags "-s -w -X github.com/ironcore-dev/metalbond.METALBOND_VERSION=$METALBOND_VERSION" -o metalbond cmd/cmd.go
 
 FROM debian:bookworm-slim AS metalbond
 
