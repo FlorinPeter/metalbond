@@ -37,7 +37,7 @@ var CLI struct {
 	Client struct {
 		Server                   []string `help:"Server address. You may define multiple servers."`
 		Subscribe                []uint32 `help:"Subscribe to VNIs"`
-		Announce                 []string `help:"Announce Prefixes in VNIs (e.g. 23#10.0.23.0/24#2001:db8::1#[STD|LB|NAT]#[FROM#TO]"`
+		Announce                 []string `help:"Announce Prefixes in VNIs (e.g. 23#10.0.23.0/24#2001:db8::1#[STD|LB|NAT]#[FROM#TO] or 23#10.0.23.0/24#2001:db8::1#123"`
 		Verbose                  bool     `help:"Enable debug logging" short:"v"`
 		InstallRoutes            []string `help:"install routes via netlink. VNI to route table mapping (e.g. 23#100 installs routes of VNI 23 to route table 100)"`
 		Tun                      string   `help:"ip6tnl tun device name"`
@@ -238,11 +238,17 @@ func main() {
 			parts := strings.Split(announcement, "#")
 			routeType := pb.NextHopType_STANDARD
 			if len(parts) != 4 && len(parts) != 3 && len(parts) != 6 {
-				log.Fatalf("malformed announcement: %s expected format vni#prefix#destHop[#routeType][#fromPort#toPort] routeType can be STD,LB or NAT", announcement)
+				log.Fatalf("malformed announcement: %s expected format vni#prefix#destHop[#routeType|#targetVni][#fromPort#toPort] routeType can be STD,LB or NAT", announcement)
 			}
 
+			targetVNI := uint32(0)
 			if len(parts) > 3 {
-				routeType = pb.ConvertCmdLineStrToEnumValue(parts[3])
+				// if parts[3] is a uint32 set the targetVNI otherwise handle routeType
+				if vni, err := strconv.ParseUint(parts[3], 10, 32); err == nil {
+					targetVNI = uint32(vni)
+				} else {
+					routeType = pb.ConvertCmdLineStrToEnumValue(parts[3])
+				}
 			}
 
 			vni, err := strconv.ParseUint(parts[0], 10, 24)
@@ -274,7 +280,7 @@ func main() {
 
 			hop := metalbond.NextHop{
 				TargetAddress: hopIP,
-				TargetVNI:     0,
+				TargetVNI:     targetVNI,
 				Type:          routeType,
 			}
 			if routeType == pb.NextHopType_NAT {

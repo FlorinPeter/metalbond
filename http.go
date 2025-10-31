@@ -37,6 +37,7 @@ func serveJsonRouteTable(m *MetalBond, listen string) {
 	http.HandleFunc("/", js.mainHandler)
 	http.HandleFunc("/routes.json", js.jsonHandler)
 	http.HandleFunc("/routes.yaml", js.yamlHandler)
+	http.HandleFunc("/health", js.healthHandler)
 	http.Handle("/metrics", metricsHandler)
 
 	if err := http.ListenAndServe(listen, nil); err != nil {
@@ -116,6 +117,11 @@ func (j *jsonServer) jsonHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		fmt.Fprintf(w, "Error: %v", err)
 	}
+}
+
+func (j *jsonServer) healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(200)
+	fmt.Fprint(w, "OK")
 }
 
 func (j *jsonServer) yamlHandler(w http.ResponseWriter, r *http.Request) {

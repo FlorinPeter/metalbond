@@ -308,13 +308,101 @@ var _ = Describe("Peer", func() {
 
 		serverPeer.stopReceive = true
 
-		time.Sleep(12 * time.Second)
+		time.Sleep(15 * time.Second)
 
 		// expect the peer state to be closed
 		Expect(clientPeer.GetState()).To(Equal(RETRY))
 
 		err = mbClient.RemovePeer(serverAddress1)
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("metalbond timeout with deadlock", func() {
+		totalClients := 100
+		var wg sync.WaitGroup
+
+		for i := 1; i <= totalClients; i++ {
+			wg.Add(1)
+
+			go func(index int) {
+				defer GinkgoRecover()
+				defer wg.Done()
+
+				mbClient := NewMetalBond(Config{
+					KeepaliveInterval: 5,
+				}, dummyClient)
+				localIP := net.ParseIP("127.0.0.2")
+				localIP = incrementIPv4(localIP, index)
+				err := mbClient.AddPeer(serverAddress1, localIP.String(), 1, 1, 1)
+				Expect(err).NotTo(HaveOccurred())
+
+				clientAddr := getLocalAddr(mbClient, "")
+				Expect(clientAddr).NotTo(Equal(""))
+
+				Expect(waitForPeerState(mbServer1, clientAddr, ESTABLISHED)).NotTo(BeFalse())
+
+				vni := VNI(200)
+				err = mbClient.Subscribe(vni)
+				Expect(err).NotTo(HaveOccurred())
+
+				var serverPeer *metalBondPeer
+				for _, peer := range mbServer1.peers {
+					serverPeer = peer
+					break
+				}
+
+				var clientPeer *metalBondPeer
+				for _, peer := range mbClient.peers {
+					clientPeer = peer
+					break
+				}
+
+				serverPeer.stopSendKeepalive = true
+
+				go func() {
+					// Create multiple update messages for the VNI
+					for {
+						startIP := net.ParseIP("100.64.0.0")
+						ip := incrementIPv4(startIP, 1)
+						addr, err := netip.ParseAddr(ip.String())
+						Expect(err).NotTo(HaveOccurred())
+
+						underlayRoute, err := netip.ParseAddr(fmt.Sprintf("b198:5b10:3880:fd32:fb80:80dd:46f7:%d", 1))
+						Expect(err).NotTo(HaveOccurred())
+
+						dest := Destination{
+							Prefix:    netip.PrefixFrom(addr, 32),
+							IPVersion: IPV4,
+						}
+						nextHop := NextHop{
+							TargetVNI:     uint32(vni),
+							TargetAddress: underlayRoute,
+						}
+
+						// Fill up the txChan of the server peer by sending update messages
+						// This simulates the "T1" phase in the race condition
+						upd := msgUpdate{
+							Action:      ADD,
+							VNI:         vni,
+							Destination: dest,
+							NextHop:     nextHop,
+						}
+						err = serverPeer.SendUpdate(upd)
+						serverPeer.log().Infof("Sent update to peer %s", addr)
+						if err != nil {
+							// If channel is full, this is expected
+							break
+						}
+					}
+				}()
+
+				time.Sleep(60 * time.Second)
+
+				// expect the peer state to be established
+				Expect(clientPeer.GetState()).To(Equal(ESTABLISHED))
+			}(i)
+		}
+		wg.Wait()
 	})
 
 	It("dummyClient timeout", func() {
@@ -345,7 +433,7 @@ var _ = Describe("Peer", func() {
 		// Close the keepalive
 		p.keepaliveStop <- true
 
-		time.Sleep(12 * time.Second)
+		time.Sleep(15 * time.Second)
 
 		// expect the peer state to be closed
 		Expect(p.GetState()).To(Equal(RETRY))

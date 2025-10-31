@@ -53,6 +53,7 @@ type metalBondPeer struct {
 	rxUpdate        chan msgUpdate
 	wg              *sync.WaitGroup
 	resetInProgress int32
+	stopRxLoop      bool
 
 	txChanCapacity           int
 	rxChanEventCapacity      int
@@ -67,6 +68,7 @@ type metalBondPeer struct {
 
 	// only used for unit test
 	stopReceive           bool
+	stopSendKeepalive     bool
 	lastKeepaliveSent     time.Time
 	lastKeepaliveReceived time.Time
 	manuallyRemoved       bool
@@ -311,7 +313,10 @@ func (p *metalBondPeer) cleanup() {
 
 func (p *metalBondPeer) handle() {
 	p.wg.Add(1)
-	defer p.wg.Done()
+	defer func() {
+		p.log().Infof("handle done")
+		p.wg.Done()
+	}()
 
 	p.txChan = make(chan []byte, p.txChanCapacity)
 	p.shutdown = make(chan bool, 5)
@@ -322,12 +327,22 @@ func (p *metalBondPeer) handle() {
 	p.rxSubscribe = make(chan msgSubscribe, p.rxChanDataUpdateCapacity)
 	p.rxUnsubscribe = make(chan msgUnsubscribe, p.rxChanDataUpdateCapacity)
 	p.rxUpdate = make(chan msgUpdate, p.rxChanDataUpdateCapacity)
+	p.stopRxLoop = false
+
+	// Create done channel for ALL loops to check
+	done := make(chan struct{})
+
+	go func() {
+		<-p.shutdown
+		close(done) // Broadcast to all loops
+	}()
 
 	// Outgoing connections still need to be established.
 	// p.conn is nil until we get a successful connection.
 	for p.conn == nil {
 		select {
-		case <-p.shutdown:
+		case <-done:
+			p.log().Info("shutting down connection until we get a successful connection")
 			p.cleanup()
 			return
 		default:
@@ -356,7 +371,8 @@ func (p *metalBondPeer) handle() {
 			// Instead of blocking with time.Sleep, wait with select so shutdown can interrupt.
 			select {
 			case <-time.After(retry):
-			case <-p.shutdown:
+			case <-done:
+				p.log().Info("shutting down connection after retry limit")
 				p.cleanup()
 				return
 			}
@@ -434,7 +450,8 @@ func (p *metalBondPeer) handle() {
 				metricRxChanUpdateMaxDepth.WithLabelValues(p.id, p.remoteAddr).Set(float64(p.maxRxChanUpdateMaxDepth))
 			}
 			p.processRxUpdate(msg)
-		case <-p.shutdown:
+		case <-done:
+			p.log().Info("shutting down connection")
 			p.cleanup()
 			return
 		}
@@ -443,12 +460,20 @@ func (p *metalBondPeer) handle() {
 
 func (p *metalBondPeer) rxLoop() {
 	p.wg.Add(1)
-	defer p.wg.Done()
+	defer func() {
+		p.log().Infof("rxLoop done")
+		p.stopRxLoop = false
+		p.wg.Done()
+	}()
 
 	var pktBuf []byte // Buffer to accumulate incoming bytes
 	readTimeout := time.Duration(p.keepaliveInterval) * time.Second * 5 * 2
 
 	for {
+		if p.stopRxLoop {
+			p.log().Infof("rxLoop stopped in outer for loop")
+			return
+		}
 		if p.stopReceive {
 			time.Sleep(1 * time.Second)
 			continue
@@ -469,12 +494,11 @@ func (p *metalBondPeer) rxLoop() {
 			return
 		}
 
-		bytesRead, err := (*p.conn).Read(buf)
 		if p.GetState() == CLOSED || p.GetState() == RETRY {
 			return
 		}
 
-		// Handle read errors
+		bytesRead, err := (*p.conn).Read(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				p.log().Errorf("Read timeout (%d), resetting connection", readTimeout)
@@ -492,6 +516,14 @@ func (p *metalBondPeer) rxLoop() {
 
 		// Process all complete packets in the buffer
 		for {
+			if p.stopRxLoop {
+				p.log().Infof("rxLoop stopped in inner for loop")
+				return
+			}
+
+			if p.GetState() == CLOSED || p.GetState() == RETRY {
+				return
+			}
 			if len(pktBuf) < 4 {
 				// Not enough data to read the 4-byte header
 				break
@@ -725,6 +757,10 @@ func (p *metalBondPeer) Close() {
 
 	// Force close the underlying connection to unblock any I/O operations.
 	if p.conn != nil {
+		// fix for deadlock in rxLoop while connection is closed
+		p.stopRxLoop = true
+		time.Sleep(1 * time.Second)
+
 		err := (*p.conn).Close()
 		if err != nil {
 			p.log().Errorf("Failed to close connection in close: %v", err)
@@ -747,6 +783,10 @@ func (p *metalBondPeer) Reset() {
 	p.log().Debugf("Reset")
 
 	p.mtxReset.Lock()
+	// fix for deadlock in rxLoop while connection is closed
+	p.stopRxLoop = true
+	time.Sleep(1 * time.Second)
+
 	if p.conn != nil {
 		if err := (*p.conn).Close(); err != nil {
 			p.log().Errorf("Failed to close connection in reset: %v", err)
@@ -803,7 +843,10 @@ func (p *metalBondPeer) Reset() {
 
 func (p *metalBondPeer) keepaliveLoop() {
 	p.wg.Add(1)
-	defer p.wg.Done()
+	defer func() {
+		p.log().Infof("keepaliveLoop done")
+		p.wg.Done()
+	}()
 
 	timeout := time.Duration(p.keepaliveInterval) * time.Second * 5 / 2
 	p.log().Infof("KEEPALIVE timeout: %v", timeout)
@@ -866,6 +909,10 @@ func (p *metalBondPeer) sendMessage(msg message) error {
 		p.log().Debugf("Sending HELLO message")
 	case msgKeepalive:
 		msgType = KEEPALIVE
+		if p.stopSendKeepalive {
+			p.log().Tracef("STOP Sending KEEPALIVE message")
+			return nil
+		}
 		p.log().Tracef("Sending KEEPALIVE message")
 	case msgSubscribe:
 		msgType = SUBSCRIBE
@@ -907,7 +954,10 @@ func (p *metalBondPeer) sendMessage(msg message) error {
 
 func (p *metalBondPeer) txLoop() {
 	p.wg.Add(1)
-	defer p.wg.Done()
+	defer func() {
+		p.log().Infof("txLoop done")
+		p.wg.Done()
+	}()
 
 	writeTimeout := 5 * time.Second
 
