@@ -44,6 +44,8 @@ MetalBond uses persistent connections to exchange route information between serv
 
 This ensures threads coordinate properly during shutdown, preventing the deadlock condition.
 
+**Next Release**: The rx channel capacity will be increased to ensure keepalive messages are always processed promptly, even under high route update load, preventing the timeout condition that triggers reconnection.
+
 ---
 
 **For detailed technical analysis, see**: `TECHNICAL_ANALYSIS_DEADLOCK.md`
