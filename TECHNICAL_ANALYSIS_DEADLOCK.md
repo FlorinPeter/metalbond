@@ -114,12 +114,13 @@ The rxLoop goroutine uses a blocking `Read()` call without:
 
 ### Contributing Factors
 
-#### 1. Fixed Small Channel Capacity
+#### 1. Default Channel Capacity Too Small
 ```go
-p.rxUpdate = make(chan msgUpdate, 100)
+p.rxUpdate = make(chan msgUpdate, p.rxChanDataUpdateCapacity)
+// Where p.rxChanDataUpdateCapacity defaults to 100
 ```
-- Hardcoded capacity of 100 messages insufficient for large route tables
-- No configurability for different deployment scenarios
+- Default capacity of 100 messages insufficient for large route tables
+- Although configurable, the default was not tuned for production workloads with thousands of routes
 
 #### 2. No Read Timeout
 ```go
@@ -257,17 +258,16 @@ case <-done:  // Instead of <-p.shutdown
 }
 ```
 
-### 7. Configurable Channel Capacities
+### 7. Enhanced Logging and Cleanup
 ```go
-type metalBondPeer struct {
-    txChanCapacity           int
-    rxChanEventCapacity      int
-    rxChanDataUpdateCapacity int
-}
-
-// Usage:
-p.rxUpdate = make(chan msgUpdate, p.rxChanDataUpdateCapacity)
+defer func() {
+    p.log().Infof("rxLoop done")
+    p.stopRxLoop = false  // Reset flag
+    p.wg.Done()
+}()
 ```
+
+**Note on Channel Capacities**: The system already had configurable channel capacities (`txChanCapacity`, `rxChanEventCapacity`, `rxChanDataUpdateCapacity`), but the default of 100 for `rxChanDataUpdateCapacity` was insufficient for large route tables. While not changed in this fix, operators can increase these values to prevent channel saturation
 
 ## Why The Fix Works
 
@@ -292,7 +292,7 @@ p.rxUpdate = make(chan msgUpdate, p.rxChanDataUpdateCapacity)
 | Exit Check Points | 1 (after Read) | 3+ (before/during/after) |
 | Grace Period | None | 1 second |
 | Buffer Strategy | Single-shot read | Packet accumulation |
-| Channel Capacity | Fixed 100 | Configurable |
+| Shutdown Coordination | Immediate close | Flag + grace period + close |
 | State Checks | After blocking | Before and after |
 
 ## Testing
