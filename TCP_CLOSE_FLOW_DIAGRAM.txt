@@ -1,0 +1,316 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║         TCP CONNECTION CLOSE FLOW - VISUAL DIAGRAM (peer.go osc/main)       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════════════════════════
+FLOW 1: ERROR IN INCOMING CONNECTION → REDUNDANT CLOSE
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────┐
+│  rxLoop Error   │  (read timeout, protocol error, deserialization fail, etc.)
+│   [line 510]    │
+└────────┬────────┘
+         │
+         v
+    ┌────────────────┐
+    │ go p.Reset()   │
+    └────────┬───────┘
+             │
+             v
+    ╔════════════════════════════════════╗
+    ║       Reset() [line 776]           ║
+    ║  ┌──────────────────────────────┐  ║
+    ║  │ 1. Atomic lock check         │  ║
+    ║  │ 2. Lock mtxReset             │  ║
+    ║  │ 3. stopRxLoop = true         │  ║
+    ║  │ 4. Sleep 1 second            │  ║
+    ║  └──────────────────────────────┘  ║
+    ║              │                      ║
+    ║              v                      ║
+    ║  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓  ║
+    ║  ┃ (*p.conn).Close() ★ CLOSE 1┃  ║  ← FIRST CLOSE (line 791)
+    ║  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ║
+    ║              │                      ║
+    ║  ┌───────────┴───────────┐         ║
+    ║  │ Direction == INCOMING?│         ║
+    ║  └───────────┬───────────┘         ║
+    ║              │ YES                  ║
+    ║              v                      ║
+    ║      ┌───────────────┐              ║
+    ║      │  p.Close()    │  [line 808]  ║
+    ║      └───────┬───────┘              ║
+    ╚══════════════╪══════════════════════╝
+                   │
+                   v
+          ╔════════════════════════════════╗
+          ║     Close() [line 752]         ║
+          ║  ┌──────────────────────────┐  ║
+          ║  │ 1. Set state = CLOSED    │  ║
+          ║  │ 2. stopRxLoop = true     │  ║
+          ║  │ 3. Sleep 1 second        │  ║
+          ║  └──────────────────────────┘  ║
+          ║              │                  ║
+          ║              v                  ║
+          ║  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓ ║
+          ║  ┃(*p.conn).Close() ★ CLOSE 2┃ ║  ← SECOND CLOSE (line 764) REDUNDANT!
+          ║  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛ ║
+          ║              │                  ║
+          ║              v                  ║
+          ║  ┌──────────────────────────┐  ║
+          ║  │ Send shutdown signals:   │  ║
+          ║  │  - txChanClose ← true    │  ║
+          ║  │  - shutdown ← true       │  ║
+          ║  │  - keepaliveStop ← true  │  ║
+          ║  └──────────────┬───────────┘  ║
+          ╚═════════════════╪══════════════╝
+                            │
+                            v
+                   ┌────────────────┐
+                   │  txLoop wakes  │
+                   │  [line 990]    │
+                   └────────┬───────┘
+                            │
+                            v
+                   ┏━━━━━━━━━━━━━━━━━━━━━━┓
+                   ┃ (*p.conn).Close()     ┃  ← THIRD CLOSE (line 993) POTENTIALLY!
+                   ┃      ★ CLOSE 3        ┃     (if txLoop hasn't exited yet)
+                   ┗━━━━━━━━━━━━━━━━━━━━━━┛
+
+
+   ⚠️  RESULT: Connection closed 2-3 times! ⚠️
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FLOW 2: ERROR IN OUTGOING CONNECTION → NO REDUNDANCY (Better, but inconsistent)
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────┐
+│  rxLoop Error   │
+└────────┬────────┘
+         │
+         v
+    ┌────────────────┐
+    │ go p.Reset()   │
+    └────────┬───────┘
+             │
+             v
+    ╔════════════════════════════════════╗
+    ║       Reset() [line 776]           ║
+    ║  ┌──────────────────────────────┐  ║
+    ║  │ 1. Atomic lock check         │  ║
+    ║  │ 2. Lock mtxReset             │  ║
+    ║  │ 3. stopRxLoop = true         │  ║
+    ║  │ 4. Sleep 1 second            │  ║
+    ║  └──────────────────────────────┘  ║
+    ║              │                      ║
+    ║              v                      ║
+    ║  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓  ║
+    ║  ┃ (*p.conn).Close() ★ CLOSE 1┃  ║  ← ONLY CLOSE (line 791)
+    ║  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛  ║
+    ║              │                      ║
+    ║  ┌───────────┴───────────┐         ║
+    ║  │ Direction == OUTGOING?│         ║
+    ║  └───────────┬───────────┘         ║
+    ║              │ YES                  ║
+    ║              v                      ║
+    ║  ┌──────────────────────────────┐  ║
+    ║  │ 1. Set state = RETRY         │  ║
+    ║  │ 2. Send shutdown signals:    │  ║
+    ║  │    - txChanClose ← true      │  ║
+    ║  │    - shutdown ← true         │  ║
+    ║  │    - keepaliveStop ← true    │  ║
+    ║  │ 3. Wait: p.wg.Wait()         │  ║
+    ║  │ 4. Reset: p.conn = nil       │  ║
+    ║  │ 5. New waitgroup             │  ║
+    ║  │ 6. Sleep retry interval      │  ║
+    ║  │ 7. Set state = CONNECTING    │  ║
+    ║  │ 8. go p.handle() (reconnect) │  ║
+    ║  └──────────────────────────────┘  ║
+    ╚════════════════════════════════════╝
+
+   ✓ RESULT: Connection closed only once (correct)
+   ⚠️ BUT: Different logic path than INCOMING (inconsistent architecture)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+COMPARISON: INCOMING vs OUTGOING PATHS
+═══════════════════════════════════════════════════════════════════════════════
+
+INCOMING Connection Reset:                OUTGOING Connection Reset:
+┌──────────────────────────┐             ┌──────────────────────────┐
+│ Reset()                  │             │ Reset()                  │
+│  ├─ Close connection (1) │             │  ├─ Close connection (1) │
+│  ├─ Call Close()         │             │  ├─ Set state = RETRY    │
+│  │   ├─ Close conn (2) ❌│             │  ├─ Send signals         │
+│  │   └─ Send signals     │             │  ├─ Wait for goroutines  │
+│  └─ RemovePeer()         │             │  ├─ Reset conn = nil     │
+│                          │             │  └─ Reconnect            │
+└──────────────────────────┘             └──────────────────────────┘
+     ↓                                          ↓
+  2 CLOSES!                                  1 CLOSE ✓
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ALL TRIGGER POINTS FOR go p.Reset()
+═══════════════════════════════════════════════════════════════════════════════
+
+┌──────────────────────────────────────────────────────────────────┐
+│                           rxLoop                                 │
+├──────────────────────────────────────────────────────────────────┤
+│ Line 493:  Failed to set read deadline                           │
+│ Line 510:  Read error (timeout, EOF, socket error)               │
+│ Line 541:  Unsupported protocol version                          │
+│ Line 546:  Payload length exceeds limit                          │
+│ Line 568:  Cannot deserialize HELLO                              │
+│ Line 580:  Cannot deserialize SUBSCRIBE                          │
+│ Line 589:  Cannot deserialize UNSUBSCRIBE                        │
+│ Line 598:  Cannot deserialize UPDATE                             │
+│ Line 605:  Unknown message type                                  │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ├─→ All lead to Reset()
+                              │
+┌──────────────────────────────────────────────────────────────────┐
+│                      processRxHello                              │
+├──────────────────────────────────────────────────────────────────┤
+│ Line 615:  Keepalive interval too low                            │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ├─→ All lead to Reset()
+                              │
+┌──────────────────────────────────────────────────────────────────┐
+│                    processRxKeepalive                            │
+├──────────────────────────────────────────────────────────────────┤
+│ Line 658:  Received keepalive in wrong state                     │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ├─→ All lead to Reset()
+                              │
+┌──────────────────────────────────────────────────────────────────┐
+│                       keepaliveLoop                              │
+├──────────────────────────────────────────────────────────────────┤
+│ Line 880:  Connection timeout (keepaliveTimer fires)             │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              ├─→ All lead to Reset()
+                              │
+┌──────────────────────────────────────────────────────────────────┐
+│                          txLoop                                  │
+├──────────────────────────────────────────────────────────────────┤
+│ Line 979:  Error setting write deadline                          │
+│ Line 987:  Incomplete message write                              │
+└──────────────────────────────────────────────────────────────────┘
+                              │
+                              └─→ All lead to Reset()
+
+
+═══════════════════════════════════════════════════════════════════════════════
+EVIDENCE: CODE SNIPPETS SHOWING REDUNDANCY
+═══════════════════════════════════════════════════════════════════════════════
+
+━━━ SNIPPET 1: Reset() closes connection (line 790-793) ━━━
+
+    if p.conn != nil {
+        if err := (*p.conn).Close(); err != nil {  // ← FIRST CLOSE
+            p.log().Errorf("Failed to close connection in reset: %v", err)
+        }
+    }
+
+━━━ SNIPPET 2: Reset() calls Close() for INCOMING (line 807-811) ━━━
+
+    case INCOMING:
+        p.Close()  // ← Calls Close() which closes AGAIN!
+        if err := p.metalbond.RemovePeer(p.remoteAddr); err != nil {
+            p.log().Errorf("Failed to remove peer: %v", err)
+        }
+
+━━━ SNIPPET 3: Close() closes connection (line 759-767) ━━━
+
+    if p.conn != nil {
+        // fix for deadlock in rxLoop while connection is closed
+        p.stopRxLoop = true
+        time.Sleep(1 * time.Second)
+
+        err := (*p.conn).Close()  // ← SECOND CLOSE (redundant!)
+        if err != nil {
+            p.log().Errorf("Failed to close connection in close: %v", err)
+        }
+    }
+
+━━━ SNIPPET 4: txLoop closes on shutdown (line 990-995) ━━━
+
+    case <-p.txChanClose:
+        p.log().Infof("Closing TCP connection in txLoop")
+        if p.conn != nil {
+            (*p.conn).Close()  // ← THIRD CLOSE (potentially!)
+        }
+        return
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️  SMOKING GUN: THE REDUNDANT CLOSE PATTERN ⚠️
+
+For INCOMING connections, this sequence executes:
+
+    1. Reset() line 791: (*p.conn).Close()     → Closes TCP
+    2. Reset() line 808: p.Close()             → Calls Close()
+    3. Close() line 764: (*p.conn).Close()     → Closes TCP AGAIN!
+    4. Close() line 771: txChanClose <- true   → Signals txLoop
+    5. txLoop line 993: (*p.conn).Close()      → Closes TCP THIRD TIME!
+
+This is the "let's close TCP again and also again" pattern you suspected!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ARCHITECTURAL ISSUE: NO SINGLE RESPONSIBILITY
+═══════════════════════════════════════════════════════════════════════════════
+
+Current reality:
+┌──────────────┐
+│   Close()    │ ────────→ Closes TCP connection
+│              │ ────────→ Sends shutdown signals
+│              │ ────────→ Called by Reset() (for INCOMING)
+└──────────────┘
+
+┌──────────────┐
+│   Reset()    │ ────────→ Closes TCP connection
+│              │ ────────→ Calls Close() (for INCOMING)
+│              │ ────────→ Duplicates Close() logic (for OUTGOING)
+│              │ ────────→ Handles reconnection (for OUTGOING)
+└──────────────┘
+
+┌──────────────┐
+│   txLoop()   │ ────────→ Closes TCP connection (on shutdown signal)
+└──────────────┘
+
+                    ⚠️ THREE DIFFERENT PLACES CLOSE TCP! ⚠️
+
+
+What it SHOULD be:
+┌────────────────────┐
+│ closeTCPConnection │ ────────→ ONLY place that closes TCP
+└────────────────────┘           (called by Close, Reset, txLoop)
+
+┌──────────────┐
+│   Close()    │ ────────→ Calls closeTCPConnection()
+│              │ ────────→ Sends shutdown signals
+│              │ ────────→ Final cleanup
+└──────────────┘
+
+┌──────────────┐
+│   Reset()    │ ────────→ Calls closeTCPConnection()
+│              │ ────────→ Handles reconnection logic
+│              │ ────────→ Does NOT call Close()
+└──────────────┘
+
+┌──────────────┐
+│   txLoop()   │ ────────→ Just exits cleanly
+│              │           (connection already closed by Close/Reset)
+└──────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+                                  END OF DIAGRAM
+═══════════════════════════════════════════════════════════════════════════════
