@@ -1,0 +1,398 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║     TCP CLOSE ARCHITECTURE COMPARISON: IMMEDIATE vs SIGNAL-FIRST            ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════════════════════════
+CURRENT APPROACH: Reset() CLOSES IMMEDIATELY
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────┐
+│ Error Event │ (timeout, socket error, protocol error, etc.)
+└──────┬──────┘
+       │
+       v
+┌────────────────────────────────────────────────────────────────────────────┐
+│                              PARALLEL STATE                                 │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────┐              ┌───────────────────┐                 │
+│  │   go p.Reset()    │              │     rxLoop        │                 │
+│  │   (new goroutine) │              │   (still running) │                 │
+│  └────────┬──────────┘              └─────────┬─────────┘                 │
+│           │                                    │                            │
+│           v                                    v                            │
+│  Acquire atomic lock                  Might be in Read()                   │
+│           │                                    │                            │
+│           v                                    │                            │
+│  Set stopRxLoop = true                         │                            │
+│           │                                    │                            │
+│           v                                    │                            │
+│  Sleep 1 second ←──────────┐                  │                            │
+│           │                 │                  │                            │
+│           │         RACE WINDOW!               │                            │
+│           │                 │                  │                            │
+│           │                 └──────────────────┴─── rxLoop might be:      │
+│           │                                         - Blocked in Read()     │
+│           │                                         - Processing packet     │
+│           │                                         - Checking stopRxLoop   │
+│           v                                                                 │
+│  ┏━━━━━━━━━━━━━━━━━━━━━━━┓                                                │
+│  ┃ (*p.conn).Close() ★   ┃ ← CLOSES CONNECTION                            │
+│  ┗━━━━━━━━━━━━━━━━━━━━━━━┛                                                │
+│           │                                                                 │
+│           v                          ┌─────────────────┐                   │
+│  Send signals:                       │   txLoop        │                   │
+│   - txChanClose ← true  ─────────────→ (still running) │                  │
+│   - shutdown ← true                  │ Might be in     │                   │
+│   - keepaliveStop ← true             │ Write()         │                   │
+│           │                          └─────────┬───────┘                   │
+│           │                                    │                            │
+│           v                                    v                            │
+│  Wait: p.wg.Wait()                    Gets: "socket closed" error          │
+│           │                                    │                            │
+│           │                                    v                            │
+│           │                          Tries to close AGAIN!                  │
+│           │                          (*p.conn).Close() ← ERROR!             │
+│           │                                    │                            │
+│           v                                    v                            │
+│  All goroutines done                  Goroutine exits                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Result Timeline:
+T0: Error detected
+T1: go p.Reset() launched
+T2: rxLoop still running, might be in Read()
+T3: Reset() closes connection ← CONNECTION CLOSED
+T4: rxLoop gets "socket closed" error
+T5: rxLoop tries to close again ← REDUNDANT
+T6: txLoop gets signal, tries to close again ← REDUNDANT
+T7: All exit
+
+Problems:
+❌ Race condition: Connection closed while goroutines active
+❌ Goroutines don't know it was intentional shutdown
+❌ Multiple close attempts (2-3 times)
+❌ Confusing error messages
+❌ Need 1-second sleep hack
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ALTERNATIVE APPROACH: SIGNAL FIRST, GOROUTINES CLOSE
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────┐
+│ Error Event │
+└──────┬──────┘
+       │
+       v
+┌────────────────────────────────────────────────────────────────────────────┐
+│                         COORDINATED SHUTDOWN                                │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────┐                                                     │
+│  │   p.Reset()       │                                                     │
+│  └────────┬──────────┘                                                     │
+│           │                                                                 │
+│           v                                                                 │
+│  Acquire atomic lock                                                        │
+│           │                                                                 │
+│           v                                                                 │
+│  ╔════════════════════════════════════════════╗                           │
+│  ║ SIGNAL ALL GOROUTINES (don't close yet!)  ║                           │
+│  ║   close(p.shutdown)  ← Broadcasts signal   ║                           │
+│  ╚════════════════════════════════════════════╝                           │
+│           │                                                                 │
+│           ├───────────────────┬────────────────────┐                       │
+│           │                   │                    │                       │
+│           v                   v                    v                       │
+│    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐             │
+│    │   rxLoop     │    │   txLoop     │    │ keepaliveLoop│             │
+│    │  Receives    │    │  Receives    │    │  Receives    │             │
+│    │  shutdown    │    │  shutdown    │    │  shutdown    │             │
+│    └──────┬───────┘    └──────┬───────┘    └──────┬───────┘             │
+│           │                   │                    │                       │
+│           v                   v                    v                       │
+│    Finish current I/O   Finish current I/O   Stop timer                    │
+│           │                   │                    │                       │
+│           v                   v                    v                       │
+│    ┏━━━━━━━━━━━━━━━━┓        │                    │                       │
+│    ┃ Close TCP conn ┃        │                    │                       │
+│    ┃  (in defer)    ┃        │                    │                       │
+│    ┗━━━━━━━━━━━━━━━━┛        │                    │                       │
+│    CONNECTION CLOSED          │                    │                       │
+│    (ONCE, CLEANLY)            │                    │                       │
+│           │                   │                    │                       │
+│           v                   v                    v                       │
+│    Exit goroutine       Exit goroutine       Exit goroutine                │
+│           │                   │                    │                       │
+│           └───────────────────┴────────────────────┘                       │
+│                               │                                             │
+│                               v                                             │
+│                      All goroutines done                                    │
+│                               │                                             │
+│                               v                                             │
+│  ┌────────────────────────────────────────┐                                │
+│  │     p.wg.Wait() returns                │                                │
+│  │     Reset() continues...               │                                │
+│  └────────────────────────────────────────┘                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Result Timeline:
+T0: Error detected
+T1: Reset() signals all goroutines
+T2: All goroutines receive signal simultaneously
+T3: Goroutines finish current operations
+T4: rxLoop closes connection ← CONNECTION CLOSED (once)
+T5: All goroutines exit
+T6: Reset() p.wg.Wait() returns
+T7: Reset() continues with reconnect logic
+
+Benefits:
+✅ No race condition: Goroutines close when ready
+✅ Single close: Only rxLoop closes connection
+✅ Clean shutdown: All goroutines coordinate
+✅ Clear messages: Know it's intentional shutdown
+✅ No hacks: No sleep, no flags
+
+
+═══════════════════════════════════════════════════════════════════════════════
+RECOMMENDED: HYBRID APPROACH (SIGNAL + TIMEOUT FALLBACK)
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────┐
+│ Error Event │
+└──────┬──────┘
+       │
+       v
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    GRACEFUL WITH SAFETY NET                                 │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────┐                                                     │
+│  │   p.Reset()       │                                                     │
+│  └────────┬──────────┘                                                     │
+│           │                                                                 │
+│           v                                                                 │
+│  ╔════════════════════════════════════╗                                   │
+│  ║ 1. SIGNAL ALL GOROUTINES          ║                                   │
+│  ║    close(p.shutdown)              ║                                   │
+│  ╚════════════════════════════════════╝                                   │
+│           │                                                                 │
+│           v                                                                 │
+│  ╔════════════════════════════════════╗                                   │
+│  ║ 2. WAIT WITH TIMEOUT              ║                                   │
+│  ║    p.wg.Wait() with 5s timeout    ║                                   │
+│  ╚════════════════════════════════════╝                                   │
+│           │                                                                 │
+│     ┌─────┴─────┐                                                          │
+│     │           │                                                           │
+│     v           v                                                           │
+│ ┌─────────┐  ┌──────────────────┐                                         │
+│ │ Success │  │ Timeout (5 sec)  │                                         │
+│ │ (fast)  │  │   (slow/hung)    │                                         │
+│ └────┬────┘  └────┬─────────────┘                                         │
+│      │            │                                                         │
+│      v            v                                                         │
+│  Goroutines   ╔═══════════════════════════╗                               │
+│  closed       ║ FALLBACK: FORCE CLOSE     ║                               │
+│  cleanly      ║   (*p.conn).Close()       ║                               │
+│      │        ║   Log: "force closing"    ║                               │
+│      │        ╚═══════════════════════════╝                               │
+│      │            │                                                         │
+│      └────────────┴─────────────────────────────────────────────────────────┐
+│                                                                             │
+│                              CONTINUE                                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Decision Tree:
+                    ┌─────────────────┐
+                    │  Reset() called │
+                    └────────┬────────┘
+                             │
+                             v
+                    ┌────────────────────┐
+                    │  Signal goroutines │
+                    └────────┬───────────┘
+                             │
+                             v
+                    ┌────────────────────┐
+                    │  Wait with timeout │
+                    └────────┬───────────┘
+                             │
+                    ┌────────┴────────┐
+                    │                 │
+                    v                 v
+            ┌──────────────┐   ┌───────────────┐
+            │ Goroutines   │   │  Timeout!     │
+            │ exited fast  │   │  (hung?)      │
+            └──────┬───────┘   └───────┬───────┘
+                   │                   │
+                   v                   v
+            No action needed    Force close connection
+            (already closed)    (safety fallback)
+                   │                   │
+                   └───────────────────┘
+                           │
+                           v
+                    Reset continues
+
+
+═══════════════════════════════════════════════════════════════════════════════
+COMPARISON: WHO CLOSES THE CONNECTION?
+═══════════════════════════════════════════════════════════════════════════════
+
+Current Approach (Immediate):
+┌──────────────┬──────────────────────────────────────┐
+│   Actor      │  Closes Connection?                  │
+├──────────────┼──────────────────────────────────────┤
+│ Reset()      │ YES - Line 791 (always)              │
+│ Close()      │ YES - Line 764 (if called)           │
+│ rxLoop       │ NO  (just exits)                     │
+│ txLoop       │ YES - Line 993 (on signal)           │
+│ keepaliveLoop│ NO  (just exits)                     │
+└──────────────┴──────────────────────────────────────┘
+Result: 2-3 close attempts! ❌
+
+Alternative Approach (Signal First):
+┌──────────────┬──────────────────────────────────────┐
+│   Actor      │  Closes Connection?                  │
+├──────────────┼──────────────────────────────────────┤
+│ Reset()      │ NO  (just signals)                   │
+│ Close()      │ NO  (not called anymore)             │
+│ rxLoop       │ YES (in defer - OWNER)               │
+│ txLoop       │ NO  (just exits)                     │
+│ keepaliveLoop│ NO  (just exits)                     │
+└──────────────┴──────────────────────────────────────┘
+Result: 1 close (clean) ✅
+
+Hybrid Approach (Recommended):
+┌──────────────┬──────────────────────────────────────┐
+│   Actor      │  Closes Connection?                  │
+├──────────────┼──────────────────────────────────────┤
+│ Reset()      │ FALLBACK (only if timeout)           │
+│ Close()      │ NO  (not needed)                     │
+│ rxLoop       │ YES (in defer - OWNER, normal case)  │
+│ txLoop       │ NO  (just exits)                     │
+│ keepaliveLoop│ NO  (just exits)                     │
+└──────────────┴──────────────────────────────────────┘
+Result: 1 close (graceful or forced) ✅
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ERROR DETECTION: CURRENT vs ALTERNATIVE
+═══════════════════════════════════════════════════════════════════════════════
+
+Current Approach - Goroutine Perspective:
+┌──────────────────────────────────────────────────────────────────┐
+│                         rxLoop                                   │
+├──────────────────────────────────────────────────────────────────┤
+│  bytesRead, err := (*p.conn).Read(buf)                           │
+│  if err != nil {                                                 │
+│      // ❓ Is this error because:                                │
+│      //    A) Network problem?                                   │
+│      //    B) Remote peer closed?                                │
+│      //    C) Reset() closed our socket?                         │
+│      // CAN'T TELL! Treat as network error:                      │
+│      p.log().Errorf("Error reading from socket: %v", err)        │
+│      go p.Reset()  // ← Might be redundant!                      │
+│      return                                                       │
+│  }                                                                │
+└──────────────────────────────────────────────────────────────────┘
+
+Alternative Approach - Goroutine Perspective:
+┌──────────────────────────────────────────────────────────────────┐
+│                         rxLoop                                   │
+├──────────────────────────────────────────────────────────────────┤
+│  select {                                                         │
+│  case <-p.shutdown:                                              │
+│      // ✅ Clear: Intentional shutdown requested                 │
+│      p.log().Info("rxLoop: graceful shutdown")                   │
+│      return  // defer closes connection                          │
+│                                                                   │
+│  default:                                                         │
+│      bytesRead, err := (*p.conn).Read(buf)                       │
+│      if err != nil {                                             │
+│          if netErr, ok := err.(net.Error); ok && netErr.Timeout() {│
+│              continue  // Just timeout, check shutdown            │
+│          }                                                        │
+│          // ✅ Real network error!                                │
+│          p.log().Errorf("Network error: %v", err)                │
+│          go p.Reset()  // Initiate shutdown                      │
+│          return  // defer closes connection                      │
+│      }                                                            │
+│  }                                                                │
+└──────────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+CODE COMPLEXITY COMPARISON
+═══════════════════════════════════════════════════════════════════════════════
+
+Current Approach - What You Need:
+┌────────────────────────────────────────────────────────────┐
+│ Flags and Hacks Required:                                  │
+├────────────────────────────────────────────────────────────┤
+│ • stopRxLoop bool (not atomic! race condition)             │
+│ • time.Sleep(1 * time.Second) hack                         │
+│ • Defensive if p.conn != nil checks everywhere             │
+│ • Error handling for close-already-closed                  │
+│ • Comments like "fix for deadlock"                         │
+│ • Different logic for INCOMING vs OUTGOING                 │
+└────────────────────────────────────────────────────────────┘
+
+Alternative Approach - What You Need:
+┌────────────────────────────────────────────────────────────┐
+│ Clean Coordination:                                         │
+├────────────────────────────────────────────────────────────┤
+│ • shutdown chan struct{} (standard Go pattern)             │
+│ • close(shutdown) to broadcast                             │
+│ • select with shutdown case in goroutines                  │
+│ • defer with cleanup in goroutine                          │
+│ • timeout for safety (5 seconds)                           │
+└────────────────────────────────────────────────────────────┘
+
+Lines of Code:
+Current:   ~150 lines of shutdown logic (spread across methods)
+Alternative: ~80 lines of shutdown logic (cleaner, centralized)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FINAL VERDICT
+═══════════════════════════════════════════════════════════════════════════════
+
+Question: Should Reset() close immediately or signal first?
+
+Answer: SIGNAL FIRST (with timeout fallback)
+
+┌─────────────────────────────────────────────────────────────────┐
+│                         SCORECARD                               │
+├────────────────────────┬────────────────┬──────────────────────┤
+│   Criteria             │ Current (Bad)  │ Alternative (Good)   │
+├────────────────────────┼────────────────┼──────────────────────┤
+│ Race conditions        │      ❌        │        ✅            │
+│ Redundant closes       │      ❌        │        ✅            │
+│ Clear ownership        │      ❌        │        ✅            │
+│ Code complexity        │      ❌        │        ✅            │
+│ Error messages         │      ❌        │        ✅            │
+│ Testability            │      ❌        │        ✅            │
+│ Go best practices      │      ❌        │        ✅            │
+│ Maintainability        │      ❌        │        ✅            │
+│ Shutdown speed         │      ✅        │        ⚠️ (slower)  │
+│ Safety (hung threads)  │      ⚠️        │        ✅ (timeout) │
+├────────────────────────┼────────────────┼──────────────────────┤
+│ TOTAL SCORE            │     1/10       │       9/10           │
+└────────────────────────┴────────────────┴──────────────────────┘
+
+Recommendation:
+🏆 ADOPT SIGNAL-FIRST APPROACH WITH TIMEOUT FALLBACK 🏆
+
+The alternative approach is SIGNIFICANTLY BETTER in almost every way.
+The only downside (slightly slower shutdown) is negligible compared to
+the architectural benefits and bug fixes.
+
+═══════════════════════════════════════════════════════════════════════════════
+                                END OF COMPARISON
+═══════════════════════════════════════════════════════════════════════════════
