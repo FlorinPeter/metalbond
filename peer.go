@@ -314,6 +314,13 @@ func (p *metalBondPeer) cleanup() {
 func (p *metalBondPeer) handle() {
 	p.wg.Add(1)
 	defer func() {
+		// Close connection owned by handle()
+		if p.conn != nil {
+			p.log().Debug("handle: closing TCP connection")
+			if err := (*p.conn).Close(); err != nil && err.Error() != "close tcp: use of closed network connection" {
+				p.log().Errorf("handle: error closing connection: %v", err)
+			}
+		}
 		p.log().Infof("handle done")
 		p.wg.Done()
 	}()
@@ -988,10 +995,7 @@ func (p *metalBondPeer) txLoop() {
 			}
 
 		case <-p.txChanClose:
-			p.log().Infof("Closing TCP connection in txLoop")
-			if p.conn != nil {
-				(*p.conn).Close()
-			}
+			p.log().Infof("txLoop: received shutdown signal, exiting")
 			return
 		}
 	}
