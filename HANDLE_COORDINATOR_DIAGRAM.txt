@@ -1,0 +1,460 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║            CORRECT ARCHITECTURE: handle() AS COORDINATOR                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════════════════════════
+THE FUNDAMENTAL PRINCIPLE
+═══════════════════════════════════════════════════════════════════════════════
+
+    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃                                                             ┃
+    ┃   THE CREATOR SHOULD BE THE DESTROYER                      ┃
+    ┃                                                             ┃
+    ┃   handle() creates connection → handle() destroys it       ┃
+    ┃   handle() starts workers → handle() coordinates them      ┃
+    ┃                                                             ┃
+    ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+
+═══════════════════════════════════════════════════════════════════════════════
+CURRENT (WRONG): CONFUSED OWNERSHIP
+═══════════════════════════════════════════════════════════════════════════════
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│                             handle()                                      │
+│                          (Coordinator)                                    │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  • Creates connection ✓                                                  │
+│  • Starts workers ✓                                                      │
+│  • Coordinates message processing ✓                                      │
+│  • Does NOT close connection ❌                                          │
+│                                                                           │
+│    ┌──────────────────────────────────────┐                              │
+│    │  go p.rxLoop()                       │                              │
+│    │  go p.txLoop()                       │                              │
+│    │  go p.keepaliveLoop()                │                              │
+│    └────┬──────────────┬──────────────┬───┘                              │
+└─────────┼──────────────┼──────────────┼──────────────────────────────────┘
+          │              │              │
+          v              v              v
+    ┌──────────┐   ┌──────────┐   ┌──────────────┐
+    │ rxLoop   │   │ txLoop   │   │ keepaliveLoop│
+    │ (Worker) │   │ (Worker) │   │  (Worker)    │
+    └────┬─────┘   └────┬─────┘   └──────┬───────┘
+         │              │                 │
+         v              v                 v
+    Tries to       Tries to          Doesn't
+    close! ❌      close! ❌          close ✓
+
+    ┌──────────┐   ┌──────────┐
+    │ Reset()  │   │ Close()  │
+    │          │   │          │
+    └────┬─────┘   └────┬─────┘
+         │              │
+         v              v
+    Tries to       Tries to
+    close! ❌      close! ❌
+
+
+Problem: 4 different places try to close the connection!
+Result:  Multiple close attempts, race conditions, errors
+
+
+═══════════════════════════════════════════════════════════════════════════════
+CORRECT: handle() OWNS THE LIFECYCLE
+═══════════════════════════════════════════════════════════════════════════════
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│                             handle()                                      │
+│                    (Coordinator & Owner)                                  │
+├───────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│  func (p *metalBondPeer) handle() {                                      │
+│      defer func() {                                                       │
+│          // OWNER: Close connection here!                                │
+│          if p.conn != nil {                                              │
+│              (*p.conn).Close()  ← SINGLE CLOSE POINT ✓                  │
+│          }                                                                │
+│      }()                                                                  │
+│                                                                           │
+│      // Create connection                                                │
+│      conn := establishConnection()                                       │
+│                                                                           │
+│      // Start workers                                                    │
+│      go p.rxLoop()        ┐                                              │
+│      go p.txLoop()        │ Workers just use connection                 │
+│      go p.keepaliveLoop() ┘                                              │
+│                                                                           │
+│      // Coordinate                                                        │
+│      for {                                                                │
+│          select {                                                         │
+│          case <-shutdown:                                                │
+│              return  // defer closes connection ✓                        │
+│          case msg := <-...:                                              │
+│              // process messages                                         │
+│          }                                                                │
+│      }                                                                    │
+│  }                                                                        │
+│                                                                           │
+└────────┬──────────────┬──────────────┬────────────────────────────────────┘
+         │              │              │
+         v              v              v
+    ┌──────────┐   ┌──────────┐   ┌──────────────┐
+    │ rxLoop   │   │ txLoop   │   │ keepaliveLoop│
+    │ (Worker) │   │ (Worker) │   │  (Worker)    │
+    └────┬─────┘   └────┬─────┘   └──────┬───────┘
+         │              │                 │
+         v              v                 v
+    Just reads     Just writes      Just keeps alive
+    from conn      to conn          the connection
+         │              │                 │
+         v              v                 v
+    On error:      On error:        On timeout:
+    shutdown←true  shutdown←true    shutdown←true
+         │              │                 │
+         └──────────────┴─────────────────┘
+                        │
+                        v
+              Signals handle() to shutdown
+              Then just exits ✓
+
+    ┌──────────┐   ┌──────────┐
+    │ Reset()  │   │ Close()  │
+    └────┬─────┘   └────┬─────┘
+         │              │
+         v              v
+    shutdown←true  shutdown←true
+         │              │
+         └──────────────┘
+                │
+                v
+       Signals handle() ✓
+       Does NOT close ✓
+
+
+Result: ONLY handle() closes (in defer)
+        Single close, clean architecture ✓
+
+
+═══════════════════════════════════════════════════════════════════════════════
+DETAILED LIFECYCLE FLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+PHASE 1: STARTUP
+━━━━━━━━━━━━━━━━━━
+
+    ┌────────────────┐
+    │ newMetalBond   │
+    │ Peer()         │
+    └───────┬────────┘
+            │
+            v
+    ┌──────────────────────────────────────────┐
+    │  go p.handle()                           │
+    │  ↓                                        │
+    │  handle() starts:                        │
+    │    1. Creates channels                   │
+    │    2. Establishes TCP connection ✓       │
+    │    3. Starts worker goroutines:          │
+    │       - go rxLoop()                      │
+    │       - go txLoop()                      │
+    │    4. Enters coordination loop           │
+    └──────────────────────────────────────────┘
+
+
+PHASE 2: NORMAL OPERATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+    │   rxLoop     │         │   handle()   │         │   txLoop     │
+    │              │         │              │         │              │
+    │ Read packets │────────→│ Process msgs │←────────│ Write packets│
+    │              │         │              │         │              │
+    └──────────────┘         └──────────────┘         └──────────────┘
+           ↑                        ↑                        ↑
+           │                        │                        │
+           └────────────────────────┴────────────────────────┘
+                      All use connection
+                      (handle() owns it)
+
+
+PHASE 3: ERROR DETECTED
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌──────────────┐
+    │   rxLoop     │  (or txLoop, or keepaliveLoop)
+    │              │
+    │ Error!       │  (timeout, socket error, protocol error, etc.)
+    │   │          │
+    │   v          │
+    │ shutdown ←   │  Send signal to handle()
+    │   true       │
+    │   │          │
+    │   v          │
+    │ return       │  Exit (don't close connection!)
+    │              │
+    └──────────────┘
+
+
+PHASE 4: COORDINATED SHUTDOWN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    ┌──────────────────────────────────────────┐
+    │           handle()                       │
+    │                                          │
+    │  for {                                   │
+    │      select {                            │
+    │      case <-shutdown:  ← Signal received │
+    │          p.cleanup()                     │
+    │          return  ───────────┐            │
+    │      }                      │            │
+    │  }                          │            │
+    │                             │            │
+    │  defer runs:                │            │
+    │      (*p.conn).Close() ←────┘            │
+    │                                          │
+    │  Connection closed! ✓                    │
+    │                                          │
+    └──────────────────────────────────────────┘
+
+    Meanwhile:
+    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+    │   rxLoop     │   │   txLoop     │   │ keepaliveLoop│
+    │              │   │              │   │              │
+    │  Already     │   │  Receives    │   │  Receives    │
+    │  exited ✓    │   │  shutdown    │   │  shutdown    │
+    │              │   │  signal      │   │  signal      │
+    │              │   │     │        │   │     │        │
+    │              │   │     v        │   │     v        │
+    │              │   │  return ✓    │   │  return ✓    │
+    └──────────────┘   └──────────────┘   └──────────────┘
+
+    All workers exit cleanly, handle() closes connection once ✓
+
+
+═══════════════════════════════════════════════════════════════════════════════
+ERROR SCENARIO COMPARISON
+═══════════════════════════════════════════════════════════════════════════════
+
+Scenario: Read timeout in rxLoop
+
+CURRENT (WRONG) FLOW:
+━━━━━━━━━━━━━━━━━━━━━
+
+T0: rxLoop: Read timeout error
+T1: rxLoop: go p.Reset()  ← Launches new goroutine
+T2: rxLoop: return (exits)
+T3: Reset(): (*p.conn).Close() ← First close
+T4: Reset(): Calls p.Close()
+T5: Close(): (*p.conn).Close() ← Second close (ERROR!)
+T6: Close(): txChanClose ← true
+T7: txLoop: (*p.conn).Close() ← Third close (ERROR!)
+T8: handle(): Receives done signal
+T9: handle(): return (doesn't close)
+
+Problems:
+❌ Connection closed 3 times
+❌ Close errors logged
+❌ Confusing who's responsible
+
+
+CORRECT (handle() OWNS) FLOW:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+T0: rxLoop: Read timeout error
+T1: rxLoop: shutdown ← true  ← Signal handle()
+T2: rxLoop: return (just exits, doesn't close)
+T3: handle(): Receives <-shutdown
+T4: handle(): p.cleanup()
+T5: handle(): return
+T6: handle() defer: (*p.conn).Close() ← SINGLE CLOSE ✓
+T7: txLoop: Receives shutdown signal
+T8: txLoop: return (just exits, doesn't close)
+T9: keepaliveLoop: Receives shutdown signal
+T10: keepaliveLoop: return (just exits, doesn't close)
+
+Result:
+✅ Connection closed ONCE
+✅ No errors
+✅ Clear responsibility (handle())
+
+
+═══════════════════════════════════════════════════════════════════════════════
+CODE CHANGES REQUIRED
+═══════════════════════════════════════════════════════════════════════════════
+
+FILE: peer.go
+
+CHANGE 1: handle() defer
+━━━━━━━━━━━━━━━━━━━━━━━
+
+Line 314-319 (current):
+    func (p *metalBondPeer) handle() {
+        p.wg.Add(1)
+        defer func() {
+            p.log().Infof("handle done")
+            p.wg.Done()
+        }()
+
+Line 314-323 (new):
+    func (p *metalBondPeer) handle() {
+        p.wg.Add(1)
+        defer func() {
+            // OWNER: Close connection
+            if p.conn != nil {
+                p.log().Debug("handle: closing TCP connection")
+                (*p.conn).Close()
+                p.conn = nil
+            }
+            p.log().Infof("handle done")
+            p.wg.Done()
+        }()
+
+
+CHANGE 2: rxLoop - remove close
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Currently: No close (already correct)
+Change: Add shutdown signal check in main loop
+
+
+CHANGE 3: txLoop - remove close
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Line 990-995 (current):
+    case <-p.txChanClose:
+        p.log().Infof("Closing TCP connection in txLoop")
+        if p.conn != nil {
+            (*p.conn).Close()  ← REMOVE THIS
+        }
+        return
+
+Line 990-993 (new):
+    case <-p.txChanClose:
+        p.log().Infof("txLoop: received close signal")
+        return  // Just exit, handle() will close
+
+
+CHANGE 4: Reset() - remove close
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Line 790-793 (current):
+    if p.conn != nil {
+        if err := (*p.conn).Close(); err != nil {  ← REMOVE THIS
+            p.log().Errorf("Failed to close connection in reset: %v", err)
+        }
+    }
+
+New:
+    // Just signal shutdown, don't close
+    select {
+    case p.shutdown <- true:
+    default:
+    }
+
+
+CHANGE 5: Close() - remove close
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Line 759-767 (current):
+    if p.conn != nil {
+        p.stopRxLoop = true
+        time.Sleep(1 * time.Second)
+        err := (*p.conn).Close()  ← REMOVE THIS
+        if err != nil {
+            p.log().Errorf("Failed to close connection in close: %v", err)
+        }
+    }
+
+New:
+    // Just signal shutdown
+    select {
+    case p.shutdown <- true:
+    default:
+    }
+
+
+═══════════════════════════════════════════════════════════════════════════════
+BENEFITS SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+┌────────────────────────────────────────────────────────────────┐
+│                   ARCHITECTURAL BENEFITS                       │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  ✅ Single Responsibility                                      │
+│     - handle() creates → handle() destroys                    │
+│     - Workers work, don't manage                              │
+│                                                                │
+│  ✅ Clear Ownership                                            │
+│     - One owner: handle()                                     │
+│     - Multiple users: rxLoop, txLoop, keepaliveLoop           │
+│                                                                │
+│  ✅ Single Close Point                                         │
+│     - Only in handle() defer                                  │
+│     - Guaranteed to run exactly once                          │
+│                                                                │
+│  ✅ No Race Conditions                                         │
+│     - Workers signal, then exit                               │
+│     - handle() closes after all workers done                  │
+│                                                                │
+│  ✅ No Redundancy                                              │
+│     - Connection closed once                                  │
+│     - No "already closed" errors                              │
+│                                                                │
+│  ✅ Simpler Code                                               │
+│     - No stopRxLoop flag                                      │
+│     - No time.Sleep hacks                                     │
+│     - No defensive checks                                     │
+│                                                                │
+│  ✅ Follows Go Patterns                                        │
+│     - Coordinator owns resources                              │
+│     - defer for cleanup                                       │
+│     - Workers signal via channels                             │
+│                                                                │
+│  ✅ Easy to Understand                                         │
+│     - Linear flow                                             │
+│     - Clear responsibilities                                  │
+│     - Obvious lifecycle                                       │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════
+FINAL ARCHITECTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+                    ┌───────────────────────────┐
+                    │      handle()             │
+                    │   (The Coordinator)       │
+                    │                           │
+                    │  • Creates connection     │
+                    │  • Starts workers         │
+                    │  • Coordinates messages   │
+                    │  • Closes connection      │
+                    │    (in defer)             │
+                    └────────────┬──────────────┘
+                                 │
+                    ┌────────────┼────────────┐
+                    │            │            │
+                    v            v            v
+            ┌──────────┐  ┌──────────┐  ┌──────────┐
+            │ rxLoop   │  │ txLoop   │  │keepalive │
+            │          │  │          │  │  Loop    │
+            │ (Worker) │  │ (Worker) │  │ (Worker) │
+            │          │  │          │  │          │
+            │ • Reads  │  │ • Writes │  │ • Pings  │
+            │ • Signals│  │ • Signals│  │ • Signals│
+            │ • Exits  │  │ • Exits  │  │ • Exits  │
+            └──────────┘  └──────────┘  └──────────┘
+
+            All workers: Use connection, don't manage it
+            Only handle(): Manages connection lifecycle
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🏆 CORRECT: handle() is the coordinator, handle() owns the lifecycle! 🏆
+
+═══════════════════════════════════════════════════════════════════════════════
