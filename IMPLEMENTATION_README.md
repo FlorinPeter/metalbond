@@ -120,7 +120,7 @@ Close connection (workers already exited)
 - **IMPLEMENTATION_SUMMARY.md** - Testing instructions and quick reference
 
 ### Detailed Documentation
-- **COMPLETE_FLOW_DOCUMENTATION.txt** - ⭐ **FULL DOCUMENTATION WITH FLOW DIAGRAMS**
+- **[docs/tcp_connection_lifecycle.md](docs/tcp_connection_lifecycle.md)** - ⭐ **FULL DOCUMENTATION WITH FLOW DIAGRAMS**
   - Complete architecture overview
   - Goroutine coordination mechanism explained
   - OUTGOING connection flow (client mode)
@@ -188,7 +188,7 @@ INFO: keepaliveLoop done
 
 ## 🎨 Flow Diagrams
 
-See **COMPLETE_FLOW_DOCUMENTATION.txt** for extensive ASCII art diagrams showing:
+See **[docs/tcp_connection_lifecycle.md](docs/tcp_connection_lifecycle.md)** for extensive flow diagrams showing:
 
 - Complete OUTGOING connection lifecycle
 - Complete INCOMING connection lifecycle
@@ -323,7 +323,8 @@ After this minimal change is validated:
 metalbond/
 ├── peer.go                                    (MODIFIED - 2 changes)
 ├── IMPLEMENTATION_README.md                   (THIS FILE - start here)
-├── COMPLETE_FLOW_DOCUMENTATION.txt           (FULL DOCS - read this!)
+├── docs/
+│   └── tcp_connection_lifecycle.md            (FULL DOCS - read this!)
 ├── IMPLEMENTATION_SUMMARY.md                  (Quick reference)
 ├── CODE_CHANGES_DOCUMENTATION.md              (Detailed changes)
 ├── INCOMING_OUTGOING_VERIFICATION.md          (Mode verification)
@@ -332,7 +333,7 @@ metalbond/
 ```
 
 **Start with:** This README
-**Then read:** COMPLETE_FLOW_DOCUMENTATION.txt
+**Then read:** docs/tcp_connection_lifecycle.md
 **Then run:** go test -v -race ./...
 
 ---
