@@ -317,8 +317,9 @@ func (p *metalBondPeer) handle() {
 		// Close connection owned by handle()
 		if p.conn != nil {
 			p.log().Debug("handle: closing TCP connection")
-			if err := (*p.conn).Close(); err != nil && err.Error() != "close tcp: use of closed network connection" {
-				p.log().Errorf("handle: error closing connection: %v", err)
+			if err := (*p.conn).Close(); err != nil {
+				// Log at debug level - connection may already be closed by Reset/Close
+				p.log().Debugf("handle: close returned error (may be already closed): %v", err)
 			}
 		}
 		p.log().Infof("handle done")
